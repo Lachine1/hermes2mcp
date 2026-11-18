@@ -188,6 +188,7 @@ class NativeRuntime:
                 name,
                 arguments,
                 task_id=task_id,
+                tool_call_id=uuid.uuid4().hex,
                 session_id=task_id,
                 enabled_tools=names,
             )
@@ -210,6 +211,7 @@ class NativeRuntime:
                 name,
                 arguments,
                 task_id=task_id,
+                tool_call_id=uuid.uuid4().hex,
                 session_id=task_id,
                 enabled_tools=names,
                 enabled_toolsets=self.toolsets,

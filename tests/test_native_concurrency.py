@@ -185,3 +185,92 @@ print(json.dumps({
     assert observed["initializations"] == ["hermes2mcp-recaller"], observed
     assert observed["database_acquisitions"] == 1, observed
     assert (profile / "state.db").is_file()
+
+
+def test_parallel_native_read_policy_hooks_have_distinct_call_identities(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    slow_path, fast_path = tmp_path / "guarded-slow.txt", tmp_path / "guarded-fast.txt"
+    slow_path.write_text("Original slow native read\n", encoding="utf-8")
+    fast_path.write_text("Original fast native read — café\n", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["HERMES_HOME"] = str(profile)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [SOURCE, str(Path(__file__).resolve().parents[1] / "src")]
+    )
+    script = r"""
+import contextlib, json, queue, sys, threading
+with contextlib.redirect_stdout(sys.stderr):
+    import model_tools
+    from hermes_cli.plugins import PluginContext, PluginManifest, _delivery_manager
+    from hermes2mcp.runtime import NativeRuntime
+    from hermes2mcp.dispatch import NativeDispatch
+    slow_path, fast_path = sys.argv[1:]
+    ready, release = threading.Event(), threading.Event()
+    replies = queue.Queue()
+    before, after = [], []
+    def guard(tool_name, args, tool_call_id=None, task_id=None, session_id=None):
+        before.append({"path": args.get("path"), "call_id": tool_call_id,
+                       "task_id": task_id, "session_id": session_id})
+        if tool_name == "read_file" and args.get("path") == slow_path:
+            ready.set()
+            if not release.wait(20):
+                raise TimeoutError("Native policy hook test gate was not released")
+    def observe(tool_name, args, tool_call_id=None, task_id=None, session_id=None):
+        after.append({"path": args.get("path"), "call_id": tool_call_id,
+                      "task_id": task_id, "session_id": session_id})
+    plugin = PluginContext(PluginManifest(name="native-policy-identity-test"), _delivery_manager())
+    handles = [plugin.register_hook("pre_tool_call", guard),
+               plugin.register_hook("post_tool_call", observe)]
+    runtime = NativeRuntime(model_tools, toolsets=["file"])
+    runtime.definitions()
+    dispatch = NativeDispatch(runtime, replies.put)
+    first = None
+    try:
+        dispatch.submit({"id":"slow", "op":"call", "name":"read_file",
+                         "arguments":{"path":slow_path}, "session_id":"reader"})
+        if not ready.wait(5):
+            raise AssertionError("Original native policy hook did not reach the gate")
+        dispatch.submit({"id":"fast", "op":"call", "name":"read_file",
+                         "arguments":{"path":fast_path}, "session_id":"reader"})
+        try:
+            first = replies.get(timeout=5)
+        except queue.Empty:
+            pass
+    finally:
+        release.set()
+        dispatch.close()
+        runtime.close()
+        for handle in handles:
+            handle.dispose()
+    results = [first] if first is not None else []
+    while not replies.empty():
+        results.append(replies.get_nowait())
+print(json.dumps({"first_before_release":first, "results":results,
+                  "pre_hooks":before, "post_hooks":after}, ensure_ascii=False))
+"""
+    result = subprocess.run(
+        [PYTHON, "-c", script, str(slow_path), str(fast_path)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert {item["id"] for item in observed["results"]} == {"slow", "fast"}, observed
+    assert all(item["ok"] for item in observed["results"]), observed
+    assert all("error" not in json.loads(item["result"]) for item in observed["results"]), observed
+    assert observed["first_before_release"]["id"] == "fast", observed
+    assert "Original fast native read — café" in observed["first_before_release"]["result"]
+    pre = {item["path"]: item for item in observed["pre_hooks"]}
+    post = {item["path"]: item for item in observed["post_hooks"]}
+    assert pre.keys() == post.keys() == {str(slow_path), str(fast_path)}, observed
+    assert all(isinstance(item["call_id"], str) and item["call_id"] for item in pre.values())
+    assert len({item["call_id"] for item in pre.values()}) == 2, observed
+    assert all(pre[path]["call_id"] == post[path]["call_id"] for path in pre), observed
+    assert all(
+        item["task_id"] == item["session_id"] == "hermes2mcp-reader"
+        for item in [*pre.values(), *post.values()]
+    ), observed

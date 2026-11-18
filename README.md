@@ -7,6 +7,7 @@ This is a protocol adapter, not a collection of rewritten tools:
 - Original Hermes tool names and descriptions.
 - Complete original input JSON schemas, including nested constraints and defaults.
 - Original registry dispatch and native inline executors, with their middleware and hooks.
+- Unique native tool-call IDs for hooks and approvals; task/session identity stays context-owned.
 - Native result strings preserved exactly in MCP text content.
 - Fresh native identity per unkeyed modern call; optional retained contexts keep todo and terminal state isolated between conversations.
 - Persistent native task identity within a legacy HTTP session, with cleanup on session deletion.
