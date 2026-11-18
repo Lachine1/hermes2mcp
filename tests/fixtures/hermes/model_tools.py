@@ -1,6 +1,8 @@
 """Test-only backend: real Python modules, not a substitute for Hermes acceptance tests."""
 
 import json
+import time
+from pathlib import Path
 
 COUNTER = 0
 DEFINITION = {
@@ -32,6 +34,13 @@ def handle_function_call(name, arguments, **kwargs):
         "task_id": kwargs["task_id"],
         "counter": COUNTER,
     }
+    value = arguments.get("value", "")
+    if isinstance(value, str) and value.startswith("fixture-wait:"):
+        gate = json.loads(value.removeprefix("fixture-wait:"))
+        Path(gate["ready"]).touch()
+        deadline = time.monotonic() + 5
+        while not Path(gate["release"]).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
     if arguments.get("probe_stdin"):
         import subprocess
         import sys

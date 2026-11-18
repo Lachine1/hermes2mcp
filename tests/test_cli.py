@@ -32,3 +32,9 @@ def test_cli_rejects_remote_binding_without_a_token_before_startup():
     result = cli("--host", "0.0.0.0")
     assert result.returncode == 2
     assert "token" in result.stderr.lower()
+
+
+def test_cli_reports_the_modern_context_release_version():
+    result = cli("--version")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "hermes2mcp 0.2.0"

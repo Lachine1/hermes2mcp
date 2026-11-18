@@ -9,6 +9,7 @@ import io
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 
@@ -56,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.pop("HERMES2MCP_TOKEN", None)
         model_tools = importlib.import_module("model_tools")
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from hermes2mcp.dispatch import NativeDispatch
         from hermes2mcp.runtime import NativeRuntime
 
         runtime = NativeRuntime(model_tools, toolsets=args.toolset)
@@ -91,33 +93,39 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    output_lock = threading.Lock()
+
+    def reply(response: dict) -> None:
+        with output_lock:
+            outgoing.write(json.dumps(response, ensure_ascii=False) + "\n")
+
+    dispatch = NativeDispatch(runtime, reply)
     try:
         for line in incoming:
+            request = {}
             try:
                 request = json.loads(line)
                 operation = request["op"]
                 if operation == "list":
                     result = runtime.definitions()
-                elif operation == "call":
-                    result = runtime.call(
-                        request["name"],
-                        request["arguments"],
-                        request["session_id"],
-                    )
-                elif operation == "release":
-                    runtime.release(request["session_id"])
-                    result = None
+                elif operation == "cancel":
+                    result = dispatch.cancel(request["target_id"])
+                elif operation in {"call", "release"}:
+                    dispatch.submit(request)
+                    continue
                 else:
                     raise ValueError("Unknown private worker operation.")
-                response = {"ok": True, "result": result}
+                response = {"id": request["id"], "ok": True, "result": result}
             except Exception as exc:
                 response = {
+                    "id": request.get("id"),
                     "ok": False,
                     "error": "Native Hermes request failed (" + type(exc).__name__ + ").",
                 }
-            outgoing.write(json.dumps(response, ensure_ascii=False) + "\n")
+            reply(response)
     finally:
         try:
+            dispatch.close()
             runtime.close()
             if shutdown_mcp is not None:
                 shutdown_mcp(timeout=2)

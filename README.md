@@ -1,6 +1,6 @@
 # hermes2mcp
 
-Expose [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s native tools through **stateful MCP Streamable HTTP** at `/mcp`.
+Expose [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s native tools through **MCP Streamable HTTP** at `/mcp`, supporting modern stateless and legacy stateful clients.
 
 This is a protocol adapter, not a collection of rewritten tools:
 
@@ -8,7 +8,8 @@ This is a protocol adapter, not a collection of rewritten tools:
 - Complete original input JSON schemas, including nested constraints and defaults.
 - Original registry dispatch and native inline executors, with their middleware and hooks.
 - Native result strings preserved exactly in MCP text content.
-- Persistent native task identity within an HTTP session; separate todo and terminal contexts between sessions.
+- Fresh native identity per unkeyed modern call; optional retained contexts keep todo and terminal state isolated between conversations.
+- Persistent native task identity within a legacy HTTP session, with cleanup on session deletion.
 - HTTP-only client interface. There is no public MCP stdio transport.
 
 **Alpha:** Hermes is installed separately. The adapter depends on native runtime interfaces; the tested Hermes revision is [`3b421578588243f920886e6fe79a6faa87ea026e`](https://github.com/NousResearch/hermes-agent/commit/3b421578588243f920886e6fe79a6faa87ea026e). The MCP SDK dependency is deliberately bounded to **2.3.x**.
@@ -75,38 +76,59 @@ Configure your client for **Streamable HTTP**, URL `http://127.0.0.1:8000/mcp`. 
 Authorization: Bearer <your-secret>
 ```
 
-Use a stateful/legacy MCP client. With SDK 2.3, `ClientSession` negotiates the supported stateful path. Modern stateless protocol `2026-07-28` is explicitly rejected rather than sharing a fallback native context.
+SDK 2.3's default `Client(url)` autodiscovers the modern `2026-07-28` protocol. Legacy `ClientSession` clients remain supported. Modern calls without a context key receive independent, temporary native identities: state such as todos is not retained between calls and never falls back to a shared global context.
 
-A Python client example (SDK 2.3 uses `httpx2` and **two** transport streams):
+A Python client example using SDK 2.3's modern autodiscovery path:
 
 ```python
 import asyncio
 import os
 
 import httpx2
-from mcp import ClientSession
+from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
 
 async def main():
     token = os.environ.get("HERMES2MCP_TOKEN")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx2.AsyncClient(headers=headers) as http:
-        async with streamable_http_client(
-            "http://127.0.0.1:8000/mcp", http_client=http
-        ) as streams:
-            async with ClientSession(*streams) as client:
-                await client.initialize()
-                tools = await client.list_tools()
-                print([tool.name for tool in tools.tools])
-                result = await client.call_tool("read_file", {"path": "README.md"})
-                print(result.content[0].text)
+    async with httpx2.AsyncClient(headers=headers, timeout=60) as http:
+        async with Client(
+            streamable_http_client("http://127.0.0.1:8000/mcp", http_client=http),
+            read_timeout_seconds=60,
+        ) as client:
+            tools = await client.list_tools()
+            print([tool.name for tool in tools.tools])
+            result = await client.call_tool("read_file", {"path": "README.md"})
+            print(result.content[0].text)
 
 
 asyncio.run(main())
 ```
 
 Paths are resolved by the server's native tools, not on the MCP client's machine.
+
+### Optional retained modern contexts
+
+For a conversation that needs persistent native todos or terminal state, configure a server bearer token and send one `X-Hermes-Context` header on its requests. Generate a key once, before constructing the HTTP client:
+
+```python
+import secrets
+
+context_key = secrets.token_hex(16)
+headers = {
+    "Authorization": f"Bearer {os.environ['HERMES2MCP_TOKEN']}",
+    "X-Hermes-Context": context_key,
+}
+```
+
+Reuse the same key to resume that conversation; use a new key for an independent conversation. Keys must be exactly 32 ASCII hexadecimal characters and are **case-sensitive**. These are application-owned native contexts, not MCP transport session IDs. Authentication is required for retained contexts even on loopback. Closing a modern client does not delete its context.
+
+Release a retained context explicitly with `DELETE /mcp/context`, supplying the same authorization and context headers. A `202` response detaches the context; native cleanup waits for its active calls to finish. A `204` response means it was already absent. Reusing a released key creates a fresh generation and does not reconnect to old state.
+
+Retained contexts expire after **1800 seconds of inactivity**, with background reaping even if no further HTTP request arrives. Active and queued calls hold their leases; idle age starts after the last call completes. The default retained-context limit is **128**. Embedders can configure `ServerSettings(max_contexts=..., context_idle_timeout=...)`; both values must be positive, and the timeout must be finite. Contexts are also released at server shutdown.
+
+Use explicit HTTP and MCP deadlines for slow tools. An injected `httpx2.AsyncClient` otherwise defaults to a five-second HTTP timeout; that can end a client while native work is still running. The example uses 60-second deadlines, not a claim that every tool completes within that time.
 
 ## Security and operational boundaries
 
@@ -120,13 +142,13 @@ Paths are resolved by the server's native tools, not on the MCP client's machine
 - DNS-rebinding protection rejects unapproved Host and Origin values. Broad CORS is not enabled.
 - The native worker does not receive `HERMES2MCP_TOKEN`. Native diagnostics go to stderr; private subprocess pipes are IPC, not an exposed MCP transport.
 - Upstream discovery is opt-in and preserves Hermes's native safe-worker gates and secret scope. Known direct bind URLs are excluded from startup discovery. **Do not configure this bridge's public proxy URL, an unlisted alias, or a redirect back to it as an upstream server.**
-- Run one ASGI worker. HTTP/native session state is process-local. Native calls are serialized; a long tool call can delay other tool calls, though it does not block the HTTP event loop.
+- Run one ASGI worker. HTTP/native context state is process-local. The native scheduler has eight execution slots: independent contexts can proceed concurrently, while calls within a context retain order unless Hermes's original admission policy marks them parallel-safe. Unknown or incompatible native admission policies remain sequential. Busy slots and context-local barriers can still cause queueing.
 - Client cancellation does not roll back an already-running native operation. Native shutdown is bounded and may terminate a busy worker.
 - Native approval behavior is retained. There is no interactive approval UI in the adapter; review your native approval policy before granting clients access.
 
 ## Runtime coverage and limitations
 
-The adapter uses Hermes's registry for ordinary tools and its original agent-runtime invocation helper for inline tools. Real `TodoStore`, built-in `MemoryStore`, session database acquisition, and lazy native delegation state are supplied per native session. Deleting an HTTP session releases its native todo/terminal resources; persistent memory files remain persistent.
+The adapter uses Hermes's registry for ordinary tools and its original agent-runtime invocation helper for inline tools. Real `TodoStore`, built-in `MemoryStore`, session database acquisition, and lazy native delegation state are supplied per native context. Legacy session deletion and modern context release/expiration clean up native resources. Hermes's own resource lifecycle stops owned background processes unless they explicitly requested `persist_on_release`; sibling contexts are not released. Persistent memory files remain persistent and are not isolated by context keys.
 
 Tool availability depends on the native installation, configured toolsets, credentials, plugins, and trust policy. No arbitrary catalog-size cap or curated tool-name list is applied. Original Hermes prefixes on upstream tools are retained, not replaced with adapter prefixes.
 
@@ -152,7 +174,7 @@ HERMES2MCP_HERMES_PATH=/path/to/hermes/workspace \
 python -m pytest --basetemp /path/to/disposable/hermes2mcp-tests
 ```
 
-The tests cover real TCP MCP connections, complete native catalog/schema equality over authenticated HTTP, a native `read_file` result compared byte-for-byte with direct dispatch, built-in memory writes, todo isolation and deletion cleanup, native session DB bootstrap, execution middleware parity, opt-in local upstream discovery, private IPC protection, and bind/auth/DNS checks.
+The tests cover real TCP MCP connections, modern SDK autodiscovery, complete native catalog/schema equality over authenticated HTTP, native `read_file` results compared byte-for-byte with dispatch, sequential and concurrent reads, built-in memory writes, ephemeral and retained todo isolation, case-sensitive keys, idle/DELETE/shutdown cleanup, active and queued context leases, native session DB bootstrap, original concurrency admission and execution middleware, background-process ownership, opt-in local upstream discovery, private IPC protection, and bind/auth/DNS checks.
 
 GitHub CI checks the adapter with a test-only native fixture on Linux/Windows and Python 3.11/3.14. Real-native tests are separate and require the selected Hermes installation; they are not silently replaced with simulated vendor responses. No paid provider or external vendor tool call is part of the acceptance suite.
 
