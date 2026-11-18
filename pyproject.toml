@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes2mcp"
+version = "0.1.0"
+description = "Expose Hermes Agent's original tools verbatim as an MCP HTTP server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Lachine" }]
+keywords = ["hermes", "mcp", "model-context-protocol", "tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["mcp>=2.3,<2.4", "uvicorn>=0.34,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1", "build>=1.2,<2"]
+
+[project.scripts]
+hermes2mcp = "hermes2mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Lachine1/hermes2mcp"
+Repository = "https://github.com/Lachine1/hermes2mcp"
+Issues = "https://github.com/Lachine1/hermes2mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes2mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["hermes: requires a real, configured Hermes Agent installation"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
